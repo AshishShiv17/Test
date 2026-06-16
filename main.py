@@ -1,7 +1,7 @@
 # main.py
 
-from Test.data import get_data
-from Test.plot import plot_graph
+from data import get_data
+from plot import plot_graph
 
 
 def main():
