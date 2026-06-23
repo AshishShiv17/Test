@@ -1,50 +1,37 @@
 """
-dashboard_service.py
-Aggregates telemetry across all runs and returns dashboard-ready metrics.
+json_service.py
+Handles export of telemetry data to JSON files.
+Used by the FastAPI layer if export is triggered via API.
 """
 
-from collections import Counter
+import json
+import logging
+from pathlib import Path
 from typing import Dict, Any
 
-from app.utils import load_all_traces
 from app.config import settings
 
+logger = logging.getLogger(__name__)
 
-def get_dashboard_summary() -> Dict[str, Any]:
-    traces = load_all_traces(settings.TELEMETRY_DIR)
 
-    if not traces:
-        return {
-            "total_runs": 0,
-            "success_count": 0,
-            "failure_count": 0,
-            "average_latency_seconds": 0,
-            "total_llm_calls": 0,
-            "total_tool_calls": 0,
-            "most_used_tools": [],
-        }
+def export_trace_to_json(trace_data: Dict[str, Any]) -> Path:
+    """
+    Persist a trace dictionary to a JSON file inside the telemetry directory.
 
-    total = len(traces)
-    success = sum(1 for t in traces if t.get("status") == "success")
-    failure = total - success
+    Args:
+        trace_data: Parsed telemetry dict (must contain 'trace_id').
 
-    latencies = [t.get("latency", 0) for t in traces]
-    avg_latency = round(sum(latencies) / total, 3)
+    Returns:
+        Path to the written file.
+    """
+    telemetry_dir: Path = settings.TELEMETRY_DIR
+    telemetry_dir.mkdir(parents=True, exist_ok=True)
 
-    total_llm = sum(t.get("llm_calls", 0) for t in traces)
-    total_tools = sum(t.get("tool_calls", 0) for t in traces)
+    trace_id = trace_data.get("trace_id", "unknown")
+    file_path = telemetry_dir / f"trace_{trace_id}.json"
 
-    tool_counter: Counter = Counter()
-    for t in traces:
-        for tool in t.get("tools", []):
-            tool_counter[tool] += 1
+    with open(file_path, "w") as f:
+        json.dump(trace_data, f, indent=2, default=str)
 
-    return {
-        "total_runs": total,
-        "success_count": success,
-        "failure_count": failure,
-        "average_latency_seconds": avg_latency,
-        "total_llm_calls": total_llm,
-        "total_tool_calls": total_tools,
-        "most_used_tools": tool_counter.most_common(5),
-    }
+    logger.info(f"Trace exported → {file_path}")
+    return file_path
