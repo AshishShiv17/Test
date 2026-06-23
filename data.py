@@ -1,37 +1,19 @@
 """
-json_service.py
-Handles export of telemetry data to JSON files.
-Used by the FastAPI layer if export is triggered via API.
+langsmith_service.py
+Reads and processes telemetry traces from local JSON files.
+In a production setup this could also query the LangSmith REST API directly.
 """
 
-import json
-import logging
-from pathlib import Path
-from typing import Dict, Any
-
+from typing import List, Dict, Any, Optional
 from app.config import settings
+from app.utils import load_all_traces, load_trace_by_id
 
-logger = logging.getLogger(__name__)
+
+def get_all_traces() -> List[Dict[str, Any]]:
+    """Return all available trace records from the telemetry directory."""
+    return load_all_traces(settings.TELEMETRY_DIR)
 
 
-def export_trace_to_json(trace_data: Dict[str, Any]) -> Path:
-    """
-    Persist a trace dictionary to a JSON file inside the telemetry directory.
-
-    Args:
-        trace_data: Parsed telemetry dict (must contain 'trace_id').
-
-    Returns:
-        Path to the written file.
-    """
-    telemetry_dir: Path = settings.TELEMETRY_DIR
-    telemetry_dir.mkdir(parents=True, exist_ok=True)
-
-    trace_id = trace_data.get("trace_id", "unknown")
-    file_path = telemetry_dir / f"trace_{trace_id}.json"
-
-    with open(file_path, "w") as f:
-        json.dump(trace_data, f, indent=2, default=str)
-
-    logger.info(f"Trace exported → {file_path}")
-    return file_path
+def get_trace_by_id(trace_id: str) -> Optional[Dict[str, Any]]:
+    """Return a single trace by its ID."""
+    return load_trace_by_id(settings.TELEMETRY_DIR, trace_id)
