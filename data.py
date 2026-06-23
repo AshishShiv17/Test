@@ -1,298 +1,129 @@
 """
-exporter.py
-Converts parsed telemetry dicts into versioned JSON files inside /telemetry.
+test_agent.py
+Smoke tests for the DummyAgent tools (no live API needed).
 """
 
-from __future__ import annotations
+from dummy_agent.tools import calculator
+
+
+def test_calculator_basic():
+    result = calculator("2 + 2")
+    assert result == "4"
+
+
+def test_calculator_multiplication():
+    result = calculator("42 * 7")
+    assert result == "294"
+
+
+def test_calculator_invalid():
+    result = calculator("import os")
+    assert "Error" in result
+"""
+test_dashboard.py
+Integration tests for the FastAPI dashboard endpoints.
+"""
+
 import json
-import logging
-import os
+import tempfile
 from pathlib import Path
-from typing import Dict, Any
+from unittest.mock import patch
 
-logger = logging.getLogger(__name__)
+from fastapi.testclient import TestClient
+from app.main import app
 
-_TELEMETRY_DIR = Path(os.getenv("TELEMETRY_DIR", "telemetry"))
+client = TestClient(app)
 
 
-def export(trace: Dict[str, Any], telemetry_dir: Path | None = None) -> Path:
-    """
-    Write a telemetry dict to a JSON file.
+def _write_trace(directory: Path, trace: dict):
+    tid = trace["trace_id"]
+    with open(directory / f"trace_{tid}.json", "w") as f:
+        json.dump(trace, f)
 
-    The file is named  trace_<trace_id>.json  and stored in `telemetry_dir`.
 
-    Args:
-        trace:         Parsed telemetry dict (must have a 'trace_id' key).
-        telemetry_dir: Override directory; defaults to $TELEMETRY_DIR env var.
+def test_health():
+    response = client.get("/health")
+    assert response.status_code == 200
+    assert response.json()["status"] == "healthy"
 
-    Returns:
-        Absolute Path of the written file.
-    """
-    out_dir = telemetry_dir or _TELEMETRY_DIR
-    out_dir.mkdir(parents=True, exist_ok=True)
 
-    trace_id = trace.get("trace_id", "unknown")
-    file_path = out_dir / f"trace_{trace_id}.json"
+def test_dashboard_summary_empty():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        with patch("app.config.settings.TELEMETRY_DIR", Path(tmpdir)):
+            response = client.get("/dashboard/summary")
+    assert response.status_code == 200
+    assert response.json()["total_runs"] == 0
 
-    with open(file_path, "w", encoding="utf-8") as fh:
-        json.dump(trace, fh, indent=2, default=str)
 
-    logger.info(f"[SDK] Trace exported → {file_path.resolve()}")
-    return file_path
+def test_dashboard_summary_with_data():
+    traces = [
+        {"trace_id": "001", "agent": "A", "status": "success", "latency": 2.0,
+         "llm_calls": 1, "tool_calls": 1, "tools": ["Search"]},
+        {"trace_id": "002", "agent": "A", "status": "failure", "latency": 4.0,
+         "llm_calls": 1, "tool_calls": 0, "tools": []},
+    ]
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tdir = Path(tmpdir)
+        for t in traces:
+            _write_trace(tdir, t)
+        with patch("app.config.settings.TELEMETRY_DIR", tdir):
+            response = client.get("/dashboard/summary")
+
+    data = response.json()
+    assert data["total_runs"] == 2
+    assert data["success_count"] == 1
+    assert data["failure_count"] == 1
+    assert data["average_latency_seconds"] == 3.0
 """
-instrument.py
-Entry point for the SDK. Call instrument() once at the start of any agent project
-to enable LangSmith tracing and automatic JSON export.
-"""
-
-import os
-import logging
-from dotenv import load_dotenv
-
-load_dotenv()
-
-logger = logging.getLogger(__name__)
-
-
-def instrument(project: str | None = None):
-    """
-    Bootstrap observability for an OpenAI Agents SDK project.
-
-    - Sets LangSmith environment variables.
-    - Confirms configuration is in place.
-
-    Args:
-        project: Optional LangSmith project name override.
-                 Falls back to LANGCHAIN_PROJECT env var.
-    """
-    _configure_langsmith(project)
-    logger.info("Observability SDK initialised. LangSmith tracing is active.")
-
-
-def _configure_langsmith(project: str | None):
-    """Push LangSmith env vars so the langsmith SDK picks them up automatically."""
-    if project:
-        os.environ["LANGCHAIN_PROJECT"] = project
-
-    required = {
-        "LANGCHAIN_TRACING_V2": os.getenv("LANGCHAIN_TRACING_V2", "true"),
-        "LANGCHAIN_ENDPOINT": os.getenv("LANGCHAIN_ENDPOINT", "https://api.smith.langchain.com"),
-        "LANGCHAIN_API_KEY": os.getenv("LANGCHAIN_API_KEY", ""),
-        "LANGCHAIN_PROJECT": os.getenv("LANGCHAIN_PROJECT", "agent-observability"),
-    }
-
-    for key, value in required.items():
-        os.environ.setdefault(key, value)
-
-    if not os.environ.get("LANGCHAIN_API_KEY"):
-        logger.warning(
-            "LANGCHAIN_API_KEY is not set. Traces will NOT be sent to LangSmith. "
-            "Add it to your .env file."
-        )
-    else:
-        logger.info(
-            f"LangSmith project: {os.environ['LANGCHAIN_PROJECT']} | "
-            f"endpoint: {os.environ['LANGCHAIN_ENDPOINT']}"
-        )
-"""
-parser.py
-Extracts structured telemetry fields from an OpenAI Agents SDK run result.
+test_sdk.py
+Unit tests for SDK parser and exporter.
 """
 
-from __future__ import annotations
-import logging
-from typing import Any, Dict, List
-
-logger = logging.getLogger(__name__)
-
-
-def parse_run_result(
-    run_result: Any,
-    agent_name: str = "UnknownAgent",
-    trace_id: str | None = None,
-    start_time: str | None = None,
-    end_time: str | None = None,
-    latency: float = 0.0,
-) -> Dict[str, Any]:
-    """
-    Parse an OpenAI Agents SDK RunResult into a standardised telemetry dict.
-
-    Args:
-        run_result:  The object returned by Runner.run() / Runner.run_sync().
-        agent_name:  Human-readable name of the agent.
-        trace_id:    Unique ID for this run (generated externally).
-        start_time:  ISO-8601 string of when the run started.
-        end_time:    ISO-8601 string of when the run ended.
-        latency:     Wall-clock seconds elapsed.
-
-    Returns:
-        A flat dict ready to be serialised to JSON.
-    """
-    tool_calls, tools_used = _extract_tool_info(run_result)
-    llm_calls = _extract_llm_calls(run_result)
-    status = _extract_status(run_result)
-    output = _extract_output(run_result)
-
-    return {
-        "trace_id": trace_id or "unknown",
-        "agent": agent_name,
-        "status": status,
-        "start_time": start_time,
-        "end_time": end_time,
-        "latency": round(latency, 4),
-        "llm_calls": llm_calls,
-        "tool_calls": tool_calls,
-        "tools": tools_used,
-        "output": output,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Private helpers
-# ---------------------------------------------------------------------------
-
-def _extract_tool_info(run_result: Any):
-    """Return (tool_call_count, list_of_tool_names)."""
-    tools: List[str] = []
-    try:
-        for item in getattr(run_result, "new_items", []):
-            item_type = getattr(item, "type", None) or type(item).__name__
-            if "tool" in str(item_type).lower():
-                name = getattr(item, "name", None) or getattr(item, "tool_name", "UnknownTool")
-                tools.append(name)
-    except Exception as exc:
-        logger.debug(f"Could not extract tool info: {exc}")
-    return len(tools), list(dict.fromkeys(tools))  # deduplicated, order preserved
-
-
-def _extract_llm_calls(run_result: Any) -> int:
-    """Count message output items as a proxy for LLM calls."""
-    try:
-        return sum(
-            1
-            for item in getattr(run_result, "new_items", [])
-            if "message" in str(getattr(item, "type", "")).lower()
-               or "response" in type(item).__name__.lower()
-        )
-    except Exception:
-        return 1  # assume at least one call
-
-
-def _extract_status(run_result: Any) -> str:
-    try:
-        if hasattr(run_result, "final_output") and run_result.final_output:
-            return "success"
-        return "failure"
-    except Exception:
-        return "unknown"
-
-
-def _extract_output(run_result: Any) -> str:
-    try:
-        return str(getattr(run_result, "final_output", ""))[:500]
-    except Exception:
-        return ""
-"""
-telemetry.py
-High-level helper that wraps an agent run, captures timing, parses the result,
-and exports a JSON trace — all in one call.
-
-Usage:
-    from sdk.telemetry import run_with_telemetry
-    from agents import Runner
-
-    result = await run_with_telemetry(
-        runner_coro=Runner.run(agent, prompt),
-        agent_name="MyAgent",
-    )
-"""
-
-from __future__ import annotations
-import asyncio
-import logging
-import time
-import uuid
-from datetime import datetime, timezone
-from typing import Any, Callable, Coroutine
+import json
+import tempfile
+from pathlib import Path
+from unittest.mock import MagicMock
 
 from sdk.parser import parse_run_result
 from sdk.exporter import export
 
-logger = logging.getLogger(__name__)
+
+def _mock_run_result(output: str = "Hello"):
+    mock = MagicMock()
+    mock.final_output = output
+    mock.new_items = []
+    return mock
 
 
-async def run_with_telemetry(
-    runner_coro: Coroutine,
-    agent_name: str = "Agent",
-) -> Any:
-    """
-    Await an OpenAI Agents SDK coroutine, measure latency, parse the result,
-    and write a JSON trace file.
-
-    Args:
-        runner_coro: Awaitable returned by  Runner.run(agent, prompt).
-        agent_name:  Label for this agent in the telemetry output.
-
-    Returns:
-        The original RunResult so callers can still use it normally.
-    """
-    trace_id = _new_trace_id()
-    start_dt = datetime.now(timezone.utc)
-    t0 = time.perf_counter()
-
-    run_result = await runner_coro
-
-    latency = time.perf_counter() - t0
-    end_dt = datetime.now(timezone.utc)
-
+def test_parse_run_result_success():
+    result = _mock_run_result("Paris is the capital of France.")
     trace = parse_run_result(
-        run_result=run_result,
-        agent_name=agent_name,
-        trace_id=trace_id,
-        start_time=start_dt.isoformat(),
-        end_time=end_dt.isoformat(),
-        latency=latency,
+        run_result=result,
+        agent_name="TestAgent",
+        trace_id="abc123",
+        start_time="2024-01-01T00:00:00+00:00",
+        end_time="2024-01-01T00:00:03+00:00",
+        latency=3.0,
     )
-
-    export(trace)
-    return run_result
-
-
-def run_with_telemetry_sync(
-    agent_name: str = "Agent",
-) -> Callable:
-    """
-    Decorator for synchronous runner calls.
-
-    Usage:
-        @run_with_telemetry_sync(agent_name="MyAgent")
-        def run_agent():
-            return Runner.run_sync(agent, prompt)
-    """
-    def decorator(fn: Callable) -> Callable:
-        def wrapper(*args, **kwargs):
-            trace_id = _new_trace_id()
-            start_dt = datetime.now(timezone.utc)
-            t0 = time.perf_counter()
-
-            run_result = fn(*args, **kwargs)
-
-            latency = time.perf_counter() - t0
-            end_dt = datetime.now(timezone.utc)
-
-            trace = parse_run_result(
-                run_result=run_result,
-                agent_name=agent_name,
-                trace_id=trace_id,
-                start_time=start_dt.isoformat(),
-                end_time=end_dt.isoformat(),
-                latency=latency,
-            )
-            export(trace)
-            return run_result
-        return wrapper
-    return decorator
+    assert trace["agent"] == "TestAgent"
+    assert trace["trace_id"] == "abc123"
+    assert trace["status"] == "success"
+    assert trace["latency"] == 3.0
 
 
-def _new_trace_id() -> str:
-    return uuid.uuid4().hex[:12]
+def test_export_creates_file():
+    trace = {
+        "trace_id": "test001",
+        "agent": "TestAgent",
+        "status": "success",
+        "latency": 1.5,
+        "llm_calls": 1,
+        "tool_calls": 0,
+        "tools": [],
+    }
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = export(trace, telemetry_dir=Path(tmpdir))
+        assert path.exists()
+        with open(path) as f:
+            loaded = json.load(f)
+        assert loaded["trace_id"] == "test001"
